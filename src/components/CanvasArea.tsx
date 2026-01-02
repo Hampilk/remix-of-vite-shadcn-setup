@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, useMemo, memo } from 'react';
+import { useRef, useState, useCallback, useMemo, memo, useEffect } from 'react';
 import Draggable, { DraggableData, DraggableEvent } from 'react-draggable';
 import { ComponentInstance, Position } from '@/types/componentInstance';
 import { getComponentById } from '@/data/componentCatalog';
@@ -18,7 +18,19 @@ import { Textarea } from '@/components/ui/textarea';
 import { Toggle } from '@/components/ui/toggle';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { ComponentEffects, generateEffectStyles, getDefaultEffects } from '@/components/ComponentEffectEditor';
-import { MousePointer2, Move, Lock, Trash2, Sparkles, Eye, EyeOff, Copy, ZoomIn, ZoomOut } from 'lucide-react';
+import { 
+  MousePointer2, 
+  Move, 
+  Lock, 
+  Trash2, 
+  Sparkles, 
+  Eye, 
+  EyeOff, 
+  Copy, 
+  ZoomIn, 
+  ZoomOut,
+  Maximize2
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 // ============================================================================
@@ -49,6 +61,7 @@ interface CanvasToolbarProps {
   onZoomIn: () => void;
   onZoomOut: () => void;
   onResetZoom: () => void;
+  onFitToScreen?: () => void;
 }
 
 interface ComponentControlsProps {
@@ -60,15 +73,27 @@ interface ComponentControlsProps {
   onToggleLock?: (e: React.MouseEvent) => void;
 }
 
+interface DraggableInstanceProps {
+  instance: ComponentInstance;
+  isSelected: boolean;
+  hasEffects: boolean;
+  onDrag: (e: DraggableEvent, data: DraggableData) => void;
+  onSelect: (multi: boolean) => void;
+  onDelete: () => void;
+  onDuplicate?: () => void;
+  onToggleLock?: () => void;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
 
 const GRID_SIZE = 20;
-const MIN_ZOOM = 0.25;
-const MAX_ZOOM = 2;
-const ZOOM_STEP = 0.25;
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 3;
+const ZOOM_STEP = 0.1;
 const DEFAULT_COMPONENT_OFFSET = { x: 50, y: 20 };
+const SNAP_THRESHOLD = 10;
 
 const CANVAS_STYLES = {
   grid: {
@@ -80,13 +105,22 @@ const CANVAS_STYLES = {
   },
 } as const;
 
+const KEYBOARD_SHORTCUTS = {
+  DELETE: ['Delete', 'Backspace'],
+  DUPLICATE: ['d'],
+  SELECT_ALL: ['a'],
+  DESELECT: ['Escape'],
+  UNDO: ['z'],
+  REDO: ['y'],
+  ZOOM_IN: ['+', '='],
+  ZOOM_OUT: ['-'],
+  ZOOM_RESET: ['0'],
+} as const;
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
 
-/**
- * Check if instance has any active effects
- */
 const hasActiveEffects = (instance: ComponentInstance): boolean => {
   if (!instance.effects || typeof instance.effects !== 'object') return false;
   const effects = instance.effects as unknown as ComponentEffects;
@@ -94,9 +128,6 @@ const hasActiveEffects = (instance: ComponentInstance): boolean => {
   return Object.values(effects).some(e => e?.enabled);
 };
 
-/**
- * Get effects from instance or return defaults
- */
 const getInstanceEffects = (instance: ComponentInstance): ComponentEffects => {
   if (instance.effects && typeof instance.effects === 'object' && 'glow' in instance.effects) {
     return instance.effects as unknown as ComponentEffects;
@@ -104,18 +135,47 @@ const getInstanceEffects = (instance: ComponentInstance): ComponentEffects => {
   return getDefaultEffects();
 };
 
-/**
- * Calculate drop position relative to canvas
- */
 const calculateDropPosition = (
   clientX: number,
   clientY: number,
   canvasRect: DOMRect,
+  zoom: number = 1,
   offset = DEFAULT_COMPONENT_OFFSET
 ): Position => ({
-  x: clientX - canvasRect.left - offset.x,
-  y: clientY - canvasRect.top - offset.y,
+  x: (clientX - canvasRect.left) / zoom - offset.x,
+  y: (clientY - canvasRect.top) / zoom - offset.y,
 });
+
+const snapToGrid = (value: number, gridSize: number = GRID_SIZE): number => {
+  return Math.round(value / gridSize) * gridSize;
+};
+
+const getBorderRadius = (radius: string | undefined): string | undefined => {
+  if (!radius) return undefined;
+  const radiusMap: Record<string, string> = {
+    none: '0px',
+    sm: '2px',
+    md: '6px',
+    lg: '8px',
+    xl: '12px',
+    '2xl': '16px',
+    '3xl': '24px',
+    full: '9999px',
+  };
+  return radiusMap[radius] || radius;
+};
+
+const getBoxShadow = (shadow: string | undefined): string | undefined => {
+  if (!shadow || shadow === 'none') return undefined;
+  const shadowMap: Record<string, string> = {
+    sm: '0 1px 2px 0 rgb(0 0 0 / 0.05)',
+    md: '0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)',
+    lg: '0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)',
+    xl: '0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)',
+    '2xl': '0 25px 50px -12px rgb(0 0 0 / 0.25)',
+  };
+  return shadowMap[shadow] || shadow;
+};
 
 // ============================================================================
 // Component Renderer
@@ -130,10 +190,8 @@ const ComponentRenderer = memo<RenderComponentProps>(({ instance }) => {
   const effectStyles = generateEffectStyles(effects);
   const hasEffects = Object.values(effects).some(e => e.enabled);
 
-  // Build transform string from all transform properties
   const transforms: string[] = [];
   
-  // 3D perspective first if set
   if (props.perspective) {
     transforms.push(`perspective(${props.perspective}px)`);
   }
@@ -153,7 +211,6 @@ const ComponentRenderer = memo<RenderComponentProps>(({ instance }) => {
   if (props.rotateY) transforms.push(`rotateY(${props.rotateY}deg)`);
   if (props.rotateZ) transforms.push(`rotateZ(${props.rotateZ}deg)`);
 
-  // Build filter string
   const filters: string[] = [];
   if (props.blur) filters.push(`blur(${props.blur}px)`);
   if (props.brightness && props.brightness !== 100) filters.push(`brightness(${props.brightness}%)`);
@@ -164,52 +221,18 @@ const ComponentRenderer = memo<RenderComponentProps>(({ instance }) => {
   if (props.invert) filters.push(`invert(${props.invert}%)`);
   if (props.contrast && props.contrast !== 100) filters.push(`contrast(${props.contrast}%)`);
 
-  // Map border radius to actual values
-  const getBorderRadius = (radius: string | undefined): string | undefined => {
-    if (!radius) return undefined;
-    const radiusMap: Record<string, string> = {
-      none: '0px',
-      sm: '2px',
-      md: '6px',
-      lg: '8px',
-      xl: '12px',
-      '2xl': '16px',
-      '3xl': '24px',
-      full: '9999px',
-    };
-    return radiusMap[radius] || radius;
-  };
-
-  // Map shadow to actual box-shadow
-  const getBoxShadow = (shadow: string | undefined): string | undefined => {
-    if (!shadow || shadow === 'none') return undefined;
-    const shadowMap: Record<string, string> = {
-      sm: '0 1px 2px 0 rgb(0 0 0 / 0.05)',
-      md: '0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)',
-      lg: '0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)',
-      xl: '0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)',
-      '2xl': '0 25px 50px -12px rgb(0 0 0 / 0.25)',
-    };
-    return shadowMap[shadow] || shadow;
-  };
-
-  // Build custom style from all inspector properties
   const customStyles: React.CSSProperties = {
-    // Size
     width: props.width || undefined,
     height: props.height || undefined,
     maxWidth: props.maxWidth as string || undefined,
     maxHeight: props.maxHeight as string || undefined,
-    // Colors & Background
     backgroundColor: props.backgroundImage ? undefined : (props.backgroundColor || undefined),
     backgroundImage: props.backgroundImage || undefined,
     color: props.textColor || undefined,
-    // Border
     borderColor: props.borderColor || undefined,
     borderWidth: props.borderWidth || undefined,
     borderStyle: (props.borderWidth || props.borderColor) ? (props.borderStyle as React.CSSProperties['borderStyle'] || 'solid') : undefined,
     borderRadius: getBorderRadius(props.borderRadius),
-    // Spacing - apply all individual padding/margin values
     paddingTop: props.paddingTop || undefined,
     paddingRight: props.paddingRight || undefined,
     paddingBottom: props.paddingBottom || undefined,
@@ -219,31 +242,23 @@ const ComponentRenderer = memo<RenderComponentProps>(({ instance }) => {
     marginBottom: props.marginBottom || undefined,
     marginLeft: props.marginLeft || undefined,
     gap: props.gap || undefined,
-    // Typography
     fontFamily: props.fontFamily ? `var(--font-${props.fontFamily}, ${props.fontFamily})` : undefined,
     fontSize: props.fontSize ? `var(--text-${props.fontSize}, ${props.fontSize})` : undefined,
     fontWeight: props.fontWeight || undefined,
     letterSpacing: props.letterSpacing || undefined,
     lineHeight: props.lineHeight || undefined,
     textAlign: props.textAlign as React.CSSProperties['textAlign'] || undefined,
-    // Layout
     display: props.display || undefined,
     flexDirection: props.flexDirection || undefined,
     justifyContent: props.justifyContent || undefined,
     alignItems: props.alignItems || undefined,
-    // Transform
     transform: transforms.length > 0 ? transforms.join(' ') : undefined,
-    // Filter
     filter: filters.length > 0 ? filters.join(' ') : undefined,
-    // Backdrop filter
     backdropFilter: props.backdropBlur ? `blur(${props.backdropBlur}px)` : undefined,
-    // Opacity
     opacity: props.opacity ?? 1,
-    // Shadow
     boxShadow: getBoxShadow(props.shadow),
   };
 
-  // Merge with effect styles
   const baseStyle: React.CSSProperties = {
     ...customStyles,
     ...effectStyles,
@@ -255,7 +270,6 @@ const ComponentRenderer = memo<RenderComponentProps>(({ instance }) => {
     className: cn(hasEffects && 'transition-all duration-300'),
   };
 
-  // Component map for cleaner rendering logic
   const componentMap: Record<string, JSX.Element> = {
     button: (
       <Button 
@@ -358,6 +372,13 @@ const ComponentRenderer = memo<RenderComponentProps>(({ instance }) => {
       {comp.name}
     </div>
   );
+}, (prev, next) => {
+  return (
+    prev.instance.id === next.instance.id &&
+    prev.instance.props === next.instance.props &&
+    prev.instance.effects === next.instance.effects &&
+    prev.instance.zIndex === next.instance.zIndex
+  );
 });
 
 ComponentRenderer.displayName = 'ComponentRenderer';
@@ -374,7 +395,7 @@ const ComponentControls = memo<ComponentControlsProps>(({
   onDuplicate,
   onToggleLock,
 }) => {
-  const controlButtons = [
+  const controlButtons = useMemo(() => [
     {
       icon: Move,
       className: 'drag-handle cursor-move hover:bg-neutral-700/90',
@@ -408,7 +429,7 @@ const ComponentControls = memo<ComponentControlsProps>(({
       ariaLabel: 'Delete component',
       show: true,
     },
-  ];
+  ], [hasEffects, instance.locked, onToggleLock, onDuplicate, onDelete]);
 
   return (
     <div 
@@ -452,11 +473,18 @@ const ComponentControls = memo<ComponentControlsProps>(({
         );
       })}
       
-      {/* Component Name Badge */}
       <div className="px-2 py-1 rounded bg-neutral-800/90 border border-neutral-700/50 text-xs text-slate-300 font-medium">
         {instance.name}
       </div>
     </div>
+  );
+}, (prev, next) => {
+  return (
+    prev.instance.id === next.instance.id &&
+    prev.instance.name === next.instance.name &&
+    prev.instance.locked === next.instance.locked &&
+    prev.isSelected === next.isSelected &&
+    prev.hasEffects === next.hasEffects
   );
 });
 
@@ -473,9 +501,9 @@ const CanvasToolbar = memo<CanvasToolbarProps>(({
   onZoomIn,
   onZoomOut,
   onResetZoom,
+  onFitToScreen,
 }) => (
   <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
-    {/* Stats */}
     <div className="flex items-center gap-3 px-3 py-1.5 rounded-lg bg-neutral-800/90 backdrop-blur-sm border border-neutral-700/50 text-xs text-slate-400">
       <span className="font-medium">{instanceCount} komponens</span>
       {selectedCount > 0 && (
@@ -486,7 +514,6 @@ const CanvasToolbar = memo<CanvasToolbarProps>(({
       )}
     </div>
 
-    {/* Zoom Controls */}
     <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-neutral-800/90 backdrop-blur-sm border border-neutral-700/50">
       <button
         onClick={onZoomOut}
@@ -518,6 +545,19 @@ const CanvasToolbar = memo<CanvasToolbarProps>(({
       >
         <ZoomIn className="h-3.5 w-3.5 text-slate-400" />
       </button>
+
+      {onFitToScreen && (
+        <>
+          <div className="w-px h-4 bg-neutral-700/50 mx-1" />
+          <button
+            onClick={onFitToScreen}
+            className="p-1 rounded hover:bg-neutral-700/50 transition-colors"
+            aria-label="Fit to screen"
+          >
+            <Maximize2 className="h-3.5 w-3.5 text-slate-400" />
+          </button>
+        </>
+      )}
     </div>
   </div>
 ));
@@ -525,19 +565,8 @@ const CanvasToolbar = memo<CanvasToolbarProps>(({
 CanvasToolbar.displayName = 'CanvasToolbar';
 
 // ============================================================================
-// Draggable Instance (uses nodeRef to avoid findDOMNode)
+// Draggable Instance
 // ============================================================================
-
-interface DraggableInstanceProps {
-  instance: ComponentInstance;
-  isSelected: boolean;
-  hasEffects: boolean;
-  onDrag: (e: DraggableEvent, data: DraggableData) => void;
-  onSelect: (multi: boolean) => void;
-  onDelete: () => void;
-  onDuplicate?: () => void;
-  onToggleLock?: () => void;
-}
 
 const DraggableInstance = memo<DraggableInstanceProps>(({
   instance,
@@ -572,7 +601,6 @@ const DraggableInstance = memo<DraggableInstanceProps>(({
           onSelect(e.shiftKey || e.metaKey);
         }}
       >
-        {/* Selection Border */}
         <div
           className={cn(
             'relative p-1 rounded-lg transition-all duration-200',
@@ -581,12 +609,10 @@ const DraggableInstance = memo<DraggableInstanceProps>(({
               : 'hover:ring-1 hover:ring-neutral-600/50'
           )}
         >
-          {/* Component Render */}
           <div className="pointer-events-none">
             <ComponentRenderer instance={instance} />
           </div>
 
-          {/* Controls Overlay */}
           <ComponentControls
             instance={instance}
             isSelected={isSelected}
@@ -607,6 +633,16 @@ const DraggableInstance = memo<DraggableInstanceProps>(({
         </div>
       </div>
     </Draggable>
+  );
+}, (prev, next) => {
+  return (
+    prev.instance.id === next.instance.id &&
+    prev.instance.position.x === next.instance.position.x &&
+    prev.instance.position.y === next.instance.position.y &&
+    prev.instance.locked === next.instance.locked &&
+    prev.instance.zIndex === next.instance.zIndex &&
+    prev.isSelected === next.isSelected &&
+    prev.hasEffects === next.hasEffects
   );
 });
 
@@ -649,14 +685,59 @@ export const CanvasArea = ({
   const canvasRef = useRef<HTMLDivElement>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [zoom, setZoom] = useState(1);
+  const [snapToGridEnabled, setSnapToGridEnabled] = useState(false);
 
-  // Memoized visible instances
   const visibleInstances = useMemo(
     () => instances.filter(instance => instance.visible),
     [instances]
   );
 
-  // Handlers
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const isModifier = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+
+      if (KEYBOARD_SHORTCUTS.DELETE.includes(e.key) && selectedIds.length > 0) {
+        e.preventDefault();
+        selectedIds.forEach(id => onDeleteInstance(id));
+      }
+
+      if (isModifier && KEYBOARD_SHORTCUTS.DUPLICATE.includes(key) && selectedIds.length > 0 && onDuplicateInstance) {
+        e.preventDefault();
+        selectedIds.forEach(id => onDuplicateInstance(id));
+      }
+
+      if (isModifier && KEYBOARD_SHORTCUTS.SELECT_ALL.includes(key)) {
+        e.preventDefault();
+        visibleInstances.forEach(instance => onSelectInstance(instance.id, true));
+      }
+
+      if (KEYBOARD_SHORTCUTS.DESELECT.includes(e.key) && selectedIds.length > 0) {
+        e.preventDefault();
+        onClearSelection();
+      }
+
+      if (isModifier && KEYBOARD_SHORTCUTS.ZOOM_IN.includes(key)) {
+        e.preventDefault();
+        setZoom(prev => Math.min(prev + ZOOM_STEP, MAX_ZOOM));
+      }
+
+      if (isModifier && KEYBOARD_SHORTCUTS.ZOOM_OUT.includes(key)) {
+        e.preventDefault();
+        setZoom(prev => Math.max(prev - ZOOM_STEP, MIN_ZOOM));
+      }
+
+      if (isModifier && KEYBOARD_SHORTCUTS.ZOOM_RESET.includes(key)) {
+        e.preventDefault();
+        setZoom(1);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedIds, visibleInstances, onDeleteInstance, onDuplicateInstance, onSelectInstance, onClearSelection]);
+
   const handleCanvasClick = useCallback((e: React.MouseEvent) => {
     if (e.target === canvasRef.current) {
       onClearSelection();
@@ -665,9 +746,12 @@ export const CanvasArea = ({
 
   const handleDrag = useCallback((id: string) => 
     (_e: DraggableEvent, data: DraggableData) => {
-      onUpdatePosition(id, { x: data.x, y: data.y });
+      const position = snapToGridEnabled 
+        ? { x: snapToGrid(data.x), y: snapToGrid(data.y) }
+        : { x: data.x, y: data.y };
+      onUpdatePosition(id, position);
     },
-    [onUpdatePosition]
+    [onUpdatePosition, snapToGridEnabled]
   );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -686,10 +770,10 @@ export const CanvasArea = ({
     const componentId = e.dataTransfer.getData('componentId');
     if (componentId && canvasRef.current) {
       const rect = canvasRef.current.getBoundingClientRect();
-      const position = calculateDropPosition(e.clientX, e.clientY, rect);
+      const position = calculateDropPosition(e.clientX, e.clientY, rect, zoom);
       onAddComponent(componentId, position);
     }
-  }, [onAddComponent]);
+  }, [onAddComponent, zoom]);
 
   const handleZoomIn = useCallback(() => {
     setZoom(prev => Math.min(prev + ZOOM_STEP, MAX_ZOOM));
@@ -702,6 +786,32 @@ export const CanvasArea = ({
   const handleResetZoom = useCallback(() => {
     setZoom(1);
   }, []);
+
+  const handleFitToScreen = useCallback(() => {
+    if (!canvasRef.current || visibleInstances.length === 0) return;
+    
+    const canvasRect = canvasRef.current.getBoundingClientRect();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    
+    visibleInstances.forEach(instance => {
+      const x = instance.position.x;
+      const y = instance.position.y;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + 200);
+      maxY = Math.max(maxY, y + 100);
+    });
+    
+    const contentWidth = maxX - minX;
+    const contentHeight = maxY - minY;
+    const padding = 50;
+    
+    const scaleX = (canvasRect.width - padding * 2) / contentWidth;
+    const scaleY = (canvasRect.height - padding * 2) / contentHeight;
+    const newZoom = Math.min(scaleX, scaleY, MAX_ZOOM);
+    
+    setZoom(Math.max(newZoom, MIN_ZOOM));
+  }, [visibleInstances]);
 
   return (
     <div
@@ -718,11 +828,16 @@ export const CanvasArea = ({
       )}
       style={CANVAS_STYLES.grid}
     >
-      {/* Empty State */}
       {visibleInstances.length === 0 && <EmptyState />}
 
-      {/* Component Instances */}
-      <div style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}>
+      <div 
+        style={{ 
+          transform: `scale(${zoom})`, 
+          transformOrigin: 'top left',
+          width: `${100 / zoom}%`,
+          height: `${100 / zoom}%`
+        }}
+      >
         {visibleInstances.map(instance => (
           <DraggableInstance
             key={instance.id}
@@ -738,7 +853,6 @@ export const CanvasArea = ({
         ))}
       </div>
 
-      {/* Canvas Toolbar */}
       <CanvasToolbar
         instanceCount={instances.length}
         selectedCount={selectedIds.length}
@@ -746,6 +860,7 @@ export const CanvasArea = ({
         onZoomIn={handleZoomIn}
         onZoomOut={handleZoomOut}
         onResetZoom={handleResetZoom}
+        onFitToScreen={handleFitToScreen}
       />
     </div>
   );
