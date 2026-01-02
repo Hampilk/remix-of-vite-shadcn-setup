@@ -333,7 +333,30 @@ export function instanceToInspectorState(instance: ComponentInstance | null): In
 // Helper: Convert InspectorState to InstanceProps
 // ============================================================================
 
+// Helper: Generate CSS background from ColorPickerValue
+function colorPickerValueToCSS(value: ColorPickerValue): { backgroundColor?: string; backgroundImage?: string } {
+  if (value.type === 'solid') {
+    return { backgroundColor: value.color };
+  }
+
+  const { gradient } = value;
+  const colorStops = `${gradient.from.color} ${gradient.from.position}%, ${gradient.via.color} ${gradient.via.position}%, ${gradient.to.color} ${gradient.to.position}%`;
+
+  switch (value.type) {
+    case 'linear':
+      return { backgroundImage: `linear-gradient(${gradient.direction}deg, ${colorStops})` };
+    case 'radial':
+      return { backgroundImage: `radial-gradient(circle at ${gradient.radialPosition.x}% ${gradient.radialPosition.y}%, ${colorStops})` };
+    case 'conic':
+      return { backgroundImage: `conic-gradient(from ${gradient.conicAngle}deg at ${gradient.radialPosition.x}% ${gradient.radialPosition.y}%, ${colorStops})` };
+    default:
+      return { backgroundColor: value.color };
+  }
+}
+
 export function inspectorStateToProps(state: InspectorState): Partial<InstanceProps> {
+  const bgStyles = colorPickerValueToCSS(state.appearance.backgroundColor);
+  
   return {
     text: state.textContent,
     padding: `${state.padding.t}px`,
@@ -379,7 +402,8 @@ export function inspectorStateToProps(state: InspectorState): Partial<InstancePr
     grayscale: state.effects.grayscale,
     invert: state.effects.invert,
     opacity: state.opacity / 100,
-    backgroundColor: state.appearance.backgroundColor.color,
+    backgroundColor: bgStyles.backgroundColor,
+    backgroundImage: bgStyles.backgroundImage,
     gap: state.spacing.gapX,
     justifyContent: state.alignment.justifyContent as InstanceProps['justifyContent'],
     alignItems: state.alignment.alignItems as InstanceProps['alignItems'],
