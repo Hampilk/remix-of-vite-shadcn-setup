@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { ComponentInstance, InstanceProps } from '@/types/componentInstance';
 
 // ============================================================================
@@ -126,7 +126,9 @@ interface HistoryEntry {
 // Constants
 // ============================================================================
 
-const MAX_HISTORY_SIZE = 30;
+const MAX_HISTORY_SIZE = 50;
+const BATCH_DELAY_MS = 16; // ~60fps
+const DEBOUNCE_HISTORY_MS = 300;
 
 export const DEFAULT_COLOR_PICKER_VALUE: ColorPickerValue = {
   type: 'solid',
@@ -194,7 +196,7 @@ export const DEFAULT_INSPECTOR_STATE: InspectorState = {
   opacity: 100,
   appearance: {
     blendMode: 'normal',
-    backgroundColor: DEFAULT_COLOR_PICKER_VALUE,
+    backgroundColor: { ...DEFAULT_COLOR_PICKER_VALUE },
     backgroundImage: '',
   },
   position: {
@@ -223,16 +225,66 @@ export const DEFAULT_INSPECTOR_STATE: InspectorState = {
 };
 
 // ============================================================================
-// Helper: Convert ComponentInstance to InspectorState
+// Helper Functions
+// ============================================================================
+
+function parseSpacing(value: string | number | undefined): number {
+  if (value === undefined || value === null) return 0;
+  if (typeof value === 'number') return value;
+  const match = String(value).match(/^(-?\d+\.?\d*)/);
+  return match ? parseFloat(match[1]) : 0;
+}
+
+function parseNumber(value: string | number | undefined): number {
+  if (value === undefined || value === null) return 0;
+  if (typeof value === 'number') return value;
+  return parseFloat(String(value)) || 0;
+}
+
+function deepClone<T>(obj: T): T {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (obj instanceof Date) return new Date(obj.getTime()) as any;
+  if (obj instanceof Array) return obj.map(item => deepClone(item)) as any;
+  if (obj instanceof Object) {
+    const clonedObj = {} as T;
+    for (const key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        clonedObj[key] = deepClone(obj[key]);
+      }
+    }
+    return clonedObj;
+  }
+  return obj;
+}
+
+function shallowEqual(obj1: any, obj2: any): boolean {
+  if (obj1 === obj2) return true;
+  if (typeof obj1 !== 'object' || typeof obj2 !== 'object') return false;
+  if (obj1 === null || obj2 === null) return false;
+  
+  const keys1 = Object.keys(obj1);
+  const keys2 = Object.keys(obj2);
+  
+  if (keys1.length !== keys2.length) return false;
+  
+  for (const key of keys1) {
+    if (obj1[key] !== obj2[key]) return false;
+  }
+  
+  return true;
+}
+
+// ============================================================================
+// Converters
 // ============================================================================
 
 export function instanceToInspectorState(instance: ComponentInstance | null): InspectorState {
-  if (!instance) return DEFAULT_INSPECTOR_STATE;
+  if (!instance) return deepClone(DEFAULT_INSPECTOR_STATE);
 
   const props = instance.props;
 
   return {
-    ...DEFAULT_INSPECTOR_STATE,
+    ...deepClone(DEFAULT_INSPECTOR_STATE),
     classes: [],
     textContent: props.text || '',
     padding: {
@@ -298,7 +350,7 @@ export function instanceToInspectorState(instance: ComponentInstance | null): In
     appearance: {
       blendMode: 'normal',
       backgroundColor: {
-        ...DEFAULT_COLOR_PICKER_VALUE,
+        ...deepClone(DEFAULT_COLOR_PICKER_VALUE),
         color: props.backgroundColor || '#3b82f6',
       },
       backgroundImage: '',
@@ -329,12 +381,10 @@ export function instanceToInspectorState(instance: ComponentInstance | null): In
   };
 }
 
-// ============================================================================
-// Helper: Convert InspectorState to InstanceProps
-// ============================================================================
-
-// Helper: Generate CSS background from ColorPickerValue
-function colorPickerValueToCSS(value: ColorPickerValue): { backgroundColor?: string; backgroundImage?: string } {
+function colorPickerValueToCSS(value: ColorPickerValue): { 
+  backgroundColor?: string; 
+  backgroundImage?: string;
+} {
   if (value.type === 'solid') {
     return { backgroundColor: value.color };
   }
@@ -411,104 +461,174 @@ export function inspectorStateToProps(state: InspectorState): Partial<InstancePr
 }
 
 // ============================================================================
-// Helper functions
-// ============================================================================
-
-function parseSpacing(value: string | number | undefined): number {
-  if (value === undefined) return 0;
-  if (typeof value === 'number') return value;
-  const match = value.match(/^(\d+)/);
-  return match ? parseInt(match[1], 10) : 0;
-}
-
-function parseNumber(value: string | number | undefined): number {
-  if (value === undefined) return 0;
-  if (typeof value === 'number') return value;
-  return parseFloat(value) || 0;
-}
-
-// ============================================================================
 // Hook
 // ============================================================================
 
 export interface UseInspectorStoreReturn {
   state: InspectorState;
   setState: React.Dispatch<React.SetStateAction<InspectorState>>;
+  updateState: (updater: (prev: InspectorState) => InspectorState) => void;
+  batchUpdate: (updates: Partial<InspectorState>) => void;
   undo: () => boolean;
   redo: () => boolean;
   canUndo: boolean;
   canRedo: boolean;
   reset: () => void;
   pushToHistory: () => void;
+  clearHistory: () => void;
 }
 
 interface UseInspectorStoreOptions {
   instance?: ComponentInstance | null;
   onUpdateProps?: (props: Partial<InstanceProps>) => void;
+  enableAutoHistory?: boolean;
+  historyDebounceMs?: number;
 }
 
 export function useInspectorStore(options: UseInspectorStoreOptions = {}): UseInspectorStoreReturn {
-  const { instance, onUpdateProps } = options;
+  const { 
+    instance, 
+    onUpdateProps,
+    enableAutoHistory = true,
+    historyDebounceMs = DEBOUNCE_HISTORY_MS
+  } = options;
   
-  // Initialize state from instance
   const [state, setStateInternal] = useState<InspectorState>(() => 
     instanceToInspectorState(instance)
   );
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [future, setFuture] = useState<HistoryEntry[]>([]);
+  
   const instanceIdRef = useRef<string | null>(null);
   const isUpdatingRef = useRef(false);
-  const pendingUpdateRef = useRef<Partial<InstanceProps> | null>(null);
+  const batchTimeoutRef = useRef<number | null>(null);
+  const historyTimeoutRef = useRef<number | null>(null);
+  const pendingPropsRef = useRef<Partial<InstanceProps> | null>(null);
+  const lastPropsRef = useRef<Partial<InstanceProps> | null>(null);
 
   // Sync state when instance changes
   useEffect(() => {
     if (instance?.id !== instanceIdRef.current) {
       instanceIdRef.current = instance?.id || null;
       isUpdatingRef.current = true;
-      setStateInternal(instanceToInspectorState(instance));
+      
+      const newState = instanceToInspectorState(instance);
+      setStateInternal(newState);
       setHistory([]);
       setFuture([]);
-      // Reset the flag after the render cycle completes
+      lastPropsRef.current = null;
+      
       requestAnimationFrame(() => {
         isUpdatingRef.current = false;
       });
     }
   }, [instance?.id]);
 
-  // Sync changes to instance props via useEffect (not during render)
+  // Batched props update effect
   useEffect(() => {
-    if (pendingUpdateRef.current && onUpdateProps && !isUpdatingRef.current) {
-      onUpdateProps(pendingUpdateRef.current);
-      pendingUpdateRef.current = null;
+    if (pendingPropsRef.current && onUpdateProps && !isUpdatingRef.current) {
+      const props = pendingPropsRef.current;
+      
+      // Only update if props actually changed
+      if (!shallowEqual(props, lastPropsRef.current)) {
+        onUpdateProps(props);
+        lastPropsRef.current = props;
+      }
+      
+      pendingPropsRef.current = null;
     }
   });
 
-  // Custom setState that queues updates for the next effect cycle
+  // Auto history effect
+  useEffect(() => {
+    if (!enableAutoHistory) return;
+
+    if (historyTimeoutRef.current) {
+      clearTimeout(historyTimeoutRef.current);
+    }
+
+    historyTimeoutRef.current = window.setTimeout(() => {
+      if (!isUpdatingRef.current) {
+        pushToHistory();
+      }
+    }, historyDebounceMs);
+
+    return () => {
+      if (historyTimeoutRef.current) {
+        clearTimeout(historyTimeoutRef.current);
+      }
+    };
+  }, [state, enableAutoHistory, historyDebounceMs]);
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      if (batchTimeoutRef.current) {
+        clearTimeout(batchTimeoutRef.current);
+      }
+      if (historyTimeoutRef.current) {
+        clearTimeout(historyTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Queue props update
+  const queuePropsUpdate = useCallback((newState: InspectorState) => {
+    if (!isUpdatingRef.current) {
+      pendingPropsRef.current = inspectorStateToProps(newState);
+    }
+  }, []);
+
+  // Standard setState
   const setState = useCallback<React.Dispatch<React.SetStateAction<InspectorState>>>(
     (action) => {
       setStateInternal((prev) => {
         const newState = typeof action === 'function' ? action(prev) : action;
-        
-        // Queue the update for the next effect cycle (not during render)
-        if (!isUpdatingRef.current) {
-          pendingUpdateRef.current = inspectorStateToProps(newState);
-        }
-        
+        queuePropsUpdate(newState);
         return newState;
       });
     },
-    []
+    [queuePropsUpdate]
   );
 
-  // Push current state to history
+  // Optimized updateState
+  const updateState = useCallback((updater: (prev: InspectorState) => InspectorState) => {
+    setState(updater);
+  }, [setState]);
+
+  // Batch update for multiple changes at once
+  const batchUpdate = useCallback((updates: Partial<InspectorState>) => {
+    setState(prev => {
+      const newState = { ...prev };
+      
+      for (const key in updates) {
+        if (updates.hasOwnProperty(key)) {
+          (newState as any)[key] = updates[key];
+        }
+      }
+      
+      return newState;
+    });
+  }, [setState]);
+
+  // Push to history
   const pushToHistory = useCallback(() => {
     setHistory(prev => {
       const newEntry: HistoryEntry = {
-        state: { ...state },
+        state: deepClone(state),
         timestamp: Date.now(),
       };
-      const newHistory = [...prev, newEntry].slice(-MAX_HISTORY_SIZE);
-      return newHistory;
+      
+      // Check if state actually changed
+      if (prev.length > 0) {
+        const lastEntry = prev[prev.length - 1];
+        if (shallowEqual(lastEntry.state, state)) {
+          return prev;
+        }
+      }
+      
+      const newHistory = [...prev, newEntry];
+      return newHistory.slice(-MAX_HISTORY_SIZE);
     });
     setFuture([]);
   }, [state]);
@@ -520,12 +640,23 @@ export function useInspectorStore(options: UseInspectorStoreOptions = {}): UseIn
     const previousEntry = history[history.length - 1];
     const newHistory = history.slice(0, -1);
 
-    setFuture(prev => [{ state: { ...state }, timestamp: Date.now() }, ...prev]);
+    setFuture(prev => [{
+      state: deepClone(state),
+      timestamp: Date.now()
+    }, ...prev].slice(0, MAX_HISTORY_SIZE));
+    
     setHistory(newHistory);
-    setState(previousEntry.state);
+    
+    isUpdatingRef.current = true;
+    setStateInternal(previousEntry.state);
+    queuePropsUpdate(previousEntry.state);
+    
+    requestAnimationFrame(() => {
+      isUpdatingRef.current = false;
+    });
 
     return true;
-  }, [history, state, setState]);
+  }, [history, state, queuePropsUpdate]);
 
   // Redo
   const redo = useCallback((): boolean => {
@@ -534,27 +665,61 @@ export function useInspectorStore(options: UseInspectorStoreOptions = {}): UseIn
     const nextEntry = future[0];
     const newFuture = future.slice(1);
 
-    setHistory(prev => [...prev, { state: { ...state }, timestamp: Date.now() }]);
+    setHistory(prev => [...prev, {
+      state: deepClone(state),
+      timestamp: Date.now()
+    }].slice(-MAX_HISTORY_SIZE));
+    
     setFuture(newFuture);
-    setState(nextEntry.state);
+    
+    isUpdatingRef.current = true;
+    setStateInternal(nextEntry.state);
+    queuePropsUpdate(nextEntry.state);
+    
+    requestAnimationFrame(() => {
+      isUpdatingRef.current = false;
+    });
 
     return true;
-  }, [future, state, setState]);
+  }, [future, state, queuePropsUpdate]);
 
-  // Reset to defaults
+  // Reset
   const reset = useCallback(() => {
     pushToHistory();
-    setState(instanceToInspectorState(instance));
+    const newState = instanceToInspectorState(instance);
+    setState(newState);
   }, [pushToHistory, setState, instance]);
 
-  return {
+  // Clear history
+  const clearHistory = useCallback(() => {
+    setHistory([]);
+    setFuture([]);
+  }, []);
+
+  // Memoize return value
+  return useMemo(() => ({
     state,
     setState,
+    updateState,
+    batchUpdate,
     undo,
     redo,
     canUndo: history.length > 0,
     canRedo: future.length > 0,
     reset,
     pushToHistory,
-  };
+    clearHistory,
+  }), [
+    state,
+    setState,
+    updateState,
+    batchUpdate,
+    undo,
+    redo,
+    history.length,
+    future.length,
+    reset,
+    pushToHistory,
+    clearHistory
+  ]);
 }
