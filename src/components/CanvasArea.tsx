@@ -200,8 +200,9 @@ const ComponentRenderer = memo<RenderComponentProps>(({ instance }) => {
     height: props.height || undefined,
     maxWidth: props.maxWidth as string || undefined,
     maxHeight: props.maxHeight as string || undefined,
-    // Colors
-    backgroundColor: props.backgroundColor || undefined,
+    // Colors & Background
+    backgroundColor: props.backgroundImage ? undefined : (props.backgroundColor || undefined),
+    backgroundImage: props.backgroundImage || undefined,
     color: props.textColor || undefined,
     // Border
     borderColor: props.borderColor || undefined,
